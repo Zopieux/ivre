@@ -115,7 +115,7 @@ class IvreTests(unittest.TestCase):
             os.path.join(root, fname)
             for root, _, files in os.walk(SAMPLES)
             for fname in files
-            if fname.endswith('.xml')
+            if fname.endswith('.xml') or fname.endswith('.json')
         ]
         cls.pcap_files = [
             os.path.join(root, fname)
@@ -140,7 +140,7 @@ class IvreTests(unittest.TestCase):
         host_stored = re.compile("^HOST STORED: ", re.M)
         scan_stored = re.compile("^SCAN STORED: ", re.M)
         host_stored_test = re.compile("^{[0-9]+:", re.M)
-        scan_duplicate = re.compile("^WARNING: Scan already present in Database. ", re.M)
+        scan_duplicate = re.compile("^WARNING: Scan already present in Database", re.M)
         for fname in self.nmap_files:
             # Insertion in DB
             res, out, _ = RUN(["./bin/nmap2db.py", "--port",
@@ -290,7 +290,7 @@ class IvreTests(unittest.TestCase):
         self.assertEqual(result.count(), addr_range_count)
 
         result = ivre.db.db.nmap.get(
-            ivre.db.db.nmap.searchscriptid("http-robots.txt"))
+            ivre.db.db.nmap.searchscript(name="http-robots.txt"))
         # Test case OK?
         count = result.count()
         self.assertGreater(count, 0)
@@ -298,14 +298,15 @@ class IvreTests(unittest.TestCase):
 
         addr = result[0]['addr']
         result = ivre.db.db.nmap.get(ivre.db.db.nmap.flt_and(
-            ivre.db.db.nmap.searchscriptid("http-robots.txt"),
+            ivre.db.db.nmap.searchscript(name="http-robots.txt"),
             ivre.db.db.nmap.searchhost(addr),
         ))
         self.assertEqual(result.count(), 1)
         count = ivre.db.db.nmap.get(
-            ivre.db.db.nmap.searchscriptidout(
-                "http-robots.txt",
-                ivre.utils.str2regexp("/cgi-bin"))).count()
+            ivre.db.db.nmap.searchscript(
+                name="http-robots.txt",
+                output=ivre.utils.str2regexp("/cgi-bin"),
+            )).count()
         self.assertGreater(count, 0)
         self.check_value("nmap_robots.txt_cgi_count", count)
 
@@ -785,6 +786,7 @@ if __name__ == '__main__':
     init_links()
     sys.path = ["bin/"] + sys.path
     import ivre.config
+    ivre.config.DEBUG = True
     import ivre.db
     import ivre.utils
     import ivre.mathutils

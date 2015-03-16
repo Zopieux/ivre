@@ -279,27 +279,35 @@ for q in query:
         if len(v) == 1:
             flt = db.nmap.flt_and(
                 flt,
-                db.nmap.searchscriptid(
-                    ivre.utils.str2regexp(v[0])))
+                db.nmap.searchscript(name=ivre.utils.str2regexp(v[0])),
+            )
         else:
             flt = db.nmap.flt_and(
                 flt,
-                db.nmap.searchscriptidout(
-                    ivre.utils.str2regexp(v[0]),
-                    ivre.utils.str2regexp(v[1])))
+                db.nmap.searchscript(
+                    name=ivre.utils.str2regexp(v[0]),
+                    output=ivre.utils.str2regexp(v[1]),
+                ),
+            )
     elif q[0] == "hostscript":
         v = q[1].split(':', 1)
         if len(v) == 1:
             flt = db.nmap.flt_and(
                 flt,
-                db.nmap.searchhostscriptid(
-                    ivre.utils.str2regexp(v[0])))
+                db.nmap.searchscript(
+                    host=True,
+                    name=ivre.utils.str2regexp(v[0]),
+                ),
+            )
         else:
             flt = db.nmap.flt_and(
                 flt,
-                db.nmap.searchhostscriptidout(
-                    ivre.utils.str2regexp(v[0]),
-                    ivre.utils.str2regexp(v[1])))
+                db.nmap.searchscript(
+                    host=True,
+                    name=ivre.utils.str2regexp(v[0]),
+                    output=ivre.utils.str2regexp(v[1]),
+                )
+            )
     # results of scripts or version scans
     elif q[0] == "anonftp":
         flt = db.nmap.flt_and(flt, db.nmap.searchftpanon())
@@ -343,8 +351,13 @@ for q in query:
         flt = db.nmap.flt_and(flt, db.nmap.searchsmb(
             **{q[0][4:]: ivre.utils.str2regexp(q[1])})
         )
+    elif q[0] == 'smbshare':
+        flt = db.nmap.flt_and(
+            flt,
+            db.nmap.searchsmbshares(access="" if q[1] is None else q[1]),
+        )
     elif nq == 'torcert':
-        flt = db.nmap.flt_and(flt, db.nmap.searchtorcert_active())
+        flt = db.nmap.flt_and(flt, db.nmap.searchtorcert())
     elif q[0] == 'webfiles':
         flt = db.nmap.flt_and(flt, db.nmap.searchwebfiles())
     elif q[0] == "webmin":
@@ -396,6 +409,22 @@ for q in query:
         flt = db.nmap.flt_and(flt,
                               db.nmap.searchport(port, protocol=proto,
                                                  state=nq))
+    elif nq == 'otheropenport':
+        flt = db.nmap.flt_and(
+            flt, db.nmap.searchportsother(map(int, q[1].split(','))))
+    elif nq == "screenshot":
+        if q[1] is None:
+            flt = db.nmap.flt_and(flt, db.nmap.searchscreenshot(neg=neg))
+        elif q[1].isdigit():
+            flt = db.nmap.flt_and(flt, db.nmap.searchscreenshot(
+                port=int(q[1]), neg=neg))
+        elif q[1].startswith('tcp/') or q[1].startswith('udp/'):
+            q[1] = q[1].split('/', 1)
+            flt = db.nmap.flt_and(flt, db.nmap.searchscreenshot(
+                port=int(q[1][1]), protocol=q[0], neg=neg))
+        else:
+            flt = db.nmap.flt_and(flt, db.nmap.searchscreenshot(
+                service=q[1], neg=neg))
     elif nq == 'display':
         # ignore this parameter
         pass
@@ -584,6 +613,9 @@ for r in result:
     for f in ['starttime', 'endtime']:
         if f in r:
             r[f] = int(r[f].strftime('%s'))
+    for port in r.get('ports', []):
+        if 'screendata' in port:
+            port['screendata'] = port['screendata'].encode('base64')
     if 'traces' in r:
         for k in r['traces']:
             k['hops'].sort(key=lambda x: x['ttl'])

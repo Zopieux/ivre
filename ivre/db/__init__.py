@@ -27,24 +27,23 @@ database.
 
 from ivre import config, utils, xmlnmap
 
-import sys
-import socket
-import re
-import struct
-import urllib
-try:
-    import urlparse
-except ImportError:
-    from urllib import parse as urlparse
-import xml.sax
-import os
-import subprocess
-import shutil
-import tempfile
-import pickle
-import uuid
-from six import iteritems
+
 from functools import reduce
+from six import iteritems
+from six.moves import urllib
+import datetime
+import json
+import os
+import pickle
+import re
+import shutil
+import socket
+import struct
+import subprocess
+import sys
+import tempfile
+import uuid
+import xml.sax
 
 # tests: I don't want to depend on cluster for now
 try:
@@ -255,8 +254,10 @@ class DBNmap(DB):
         self.argparser.add_argument('--hostname')
         self.argparser.add_argument('--domain')
         self.argparser.add_argument('--net', metavar='IP/MASK')
+        self.argparser.add_argument('--range', metavar='START STOP', nargs=2)
         self.argparser.add_argument('--hop', metavar='IP')
         self.argparser.add_argument('--port', metavar='PORT')
+        self.argparser.add_argument('--not-port', metavar='PORT')
         self.argparser.add_argument('--openport', action='store_true')
         self.argparser.add_argument('--no-openport', action='store_true')
         self.argparser.add_argument('--service', metavar='SVC')
@@ -279,10 +280,34 @@ class DBNmap(DB):
         self.argparser.add_argument('--sshkey')
         self.argparser.add_argument('--archives', action='store_true')
 
+    def is_scan_present(self, _):
+        return False
+
     def store_scan(self, fname, **kargs):
-        """This method parses a scan result, displays a JSON version
-        of the result, and return True if everything went fine, False
-        otherwise.
+        """This method opens a scan result, and calls the appropriate
+        store_scan_* method to parse (and store) the scan result.
+
+        """
+        scanid = utils.hash_file(fname, hashtype="sha256").hexdigest()
+        if self.is_scan_present(scanid):
+            if config.DEBUG:
+                sys.stderr.write("WARNING: Scan already present in Database"
+                                 " (%r).\n" % fname)
+            return False
+        with utils.open_file(fname) as fdesc:
+            fchar = fdesc.read(1)
+            try:
+                return {
+                    '<': self.store_scan_xml,
+                    '{': self.store_scan_json,
+                }[fchar](fname, filehash=scanid, **kargs)
+            except KeyError:
+                raise ValueError("Unknown file type %s" % fname)
+
+    def store_scan_xml(self, fname, **kargs):
+        """This method parses an XML scan result, displays a JSON
+        version of the result, and return True if everything went
+        fine, False otherwise.
 
         In backend-specific subclasses, this method stores the result
         instead of displaying it, thanks to the `content_handler`
@@ -298,10 +323,61 @@ class DBNmap(DB):
         else:
             parser.setContentHandler(content_handler)
             parser.setEntityResolver(xmlnmap.NoExtResolver())
-            parser.parse(fname)
+            parser.parse(utils.open_file(fname))
             content_handler.outputresults()
             return True
         return False
+
+    def store_scan_json(self, fname, filehash=None, needports=False,
+                        categories=None, source=None,
+                        gettoarchive=None, add_addr_infos=True,
+                        force_info=False):
+        """This method parses a JSON scan result as exported using
+        `scancli --json > file`, displays the parsing result, and
+        return True if everything went fine, False otherwise.
+
+        In backend-specific subclasses, this method stores the result
+        instead of displaying it, thanks to the `store_host`
+        method.
+
+        """
+        if categories is None:
+            categories = []
+        with utils.open_file(fname) as fdesc:
+            for line in fdesc:
+                host = self.json2dbrec(json.loads(line))
+                for fname in ["_id"]:
+                    if fname in host:
+                        del host[fname]
+                host["scanid"] = filehash
+                if categories:
+                    host["categories"] = categories
+                if source is not None:
+                    host["source"] = source
+                if add_addr_infos and self.globaldb is not None and (
+                        force_info or 'infos' not in host or not host['infos']
+                ):
+                    host['infos'] = {}
+                    for func in [self.globaldb.data.country_byip,
+                                 self.globaldb.data.as_byip,
+                                 self.globaldb.data.location_byip]:
+                        data = func(host['addr'])
+                        if data:
+                            host['infos'].update(data)
+                self.archive_from_func(host, gettoarchive)
+                if not needports or 'ports' in host:
+                    self.store_host(host)
+        return True
+
+    @staticmethod
+    def json2dbrec(host):
+        raise NotImplementedError
+
+    def store_host(self, host):
+        print host
+
+    def archive_from_func(self, _ig1, _ig2):
+        pass
 
     def get_mean_open_ports(self, flt, archive=False):
         """This method returns for a specific query `flt` a list of
@@ -339,80 +415,87 @@ class DBNmap(DB):
         # return result
 
     def searchsshkey(self, key):
-        return self.searchscriptidout(
-            'ssh-hostkey',
-            re.compile(re.escape(key), flags=re.I))
+        return self.searchscript(
+            name='ssh-hostkey',
+            output=re.compile(re.escape(key), flags=re.I),
+        )
 
     def searchx11access(self):
-        return self.searchscriptidout('x11-access',
-                                      'X server access is granted')
+        return self.searchscript(name='x11-access',
+                                 output='X server access is granted')
 
     def searchbanner(self, banner):
-        return self.searchscriptidout('banner', banner)
+        return self.searchscript(name='banner', output=banner)
 
     def searchvncauthbypass(self):
-        return self.searchscriptid("realvnc-auth-bypass")
+        return self.searchscript(name="realvnc-auth-bypass")
 
     def searchmssqlemptypwd(self):
-        return self.searchscriptidout(
-            'ms-sql-empty-password',
-            re.compile('Login\\ Success', flags=0))
+        return self.searchscript(
+            name='ms-sql-empty-password',
+            output=re.compile('Login\\ Success', flags=0),
+        )
 
     def searchmysqlemptypwd(self):
-        return self.searchscriptidout(
-            'mysql-empty-password',
-            re.compile('account\\ has\\ empty\\ password', flags=0))
+        return self.searchscript(
+            name='mysql-empty-password',
+            output=re.compile('account\\ has\\ empty\\ password', flags=0),
+        )
 
     def searchcookie(self, name):
-        return self.searchscriptidout(
-            'http-headers',
-            re.compile('^ *Set-Cookie: %s=' % re.escape(name),
-                       flags=re.MULTILINE | re.I))
+        return self.searchscript(
+            name='http-headers',
+            output=re.compile('^ *Set-Cookie: %s=' % re.escape(name),
+                              flags=re.MULTILINE | re.I),
+        )
 
     def searchftpanon(self):
-        return self.searchscriptidout(
-            'ftp-anon',
-            re.compile('^Anonymous\\ FTP\\ login\\ allowed',
-                       flags=0))
+        return self.searchscript(
+            name='ftp-anon',
+            output=re.compile('^Anonymous\\ FTP\\ login\\ allowed', flags=0),
+        )
 
     def searchhttpauth(self, newscript=True, oldscript=False):
         # $or queries are too slow, by default support only new script
         # output.
         res = []
         if newscript:
-            res.append(self.searchscriptidout(
-                'http-default-accounts',
-                re.compile('credentials\\ found')))
+            res.append(self.searchscript(
+                name='http-default-accounts',
+                output=re.compile('credentials\\ found')))
         if oldscript:
-            res.append(self.searchscriptidout(
-                'http-auth',
-                re.compile('HTTP\\ server\\ may\\ accept')))
+            res.append(self.searchscript(
+                name='http-auth',
+                output=re.compile('HTTP\\ server\\ may\\ accept')))
         if not res:
             raise Exception('"newscript" and "oldscript" are both False')
-        if len(res) == 1:
-            return res[0]
         return self.flt_or(*res)
 
     def searchowa(self):
         return self.flt_or(
-            self.searchscriptidout(
-                'http-headers',
-                re.compile('^ *(Location:.*(owa|exchweb)|X-OWA-Version)',
-                           flags=re.MULTILINE | re.I)),
-            self.searchscriptidout(
-                'http-auth-finder',
-                re.compile('/(owa|exchweb)',
-                           flags=re.I)),
-            self.searchscriptidout(
-                'http-title',
-                re.compile('Outlook Web A|(Requested resource was|'
-                           'Did not follow redirect to ).*/(owa|exchweb)',
-                           flags=re.I)),
-            self.searchscriptidout(
-                'html-title',
-                re.compile('Outlook Web A|(Requested resource was|'
-                           'Did not follow redirect to ).*/(owa|exchweb)',
-                           flags=re.I))
+            self.searchscript(
+                name='http-headers',
+                output=re.compile(
+                    '^ *(Location:.*(owa|exchweb)|X-OWA-Version)',
+                    flags=re.MULTILINE | re.I,
+                ),
+            ),
+            self.searchscript(
+                name='http-auth-finder',
+                output=re.compile('/(owa|exchweb)', flags=re.I),
+            ),
+            self.searchscript(
+                name='http-title',
+                output=re.compile('Outlook Web A|(Requested resource was|'
+                                  'Did not follow redirect to ).*'
+                                  '/(owa|exchweb)', flags=re.I),
+            ),
+            self.searchscript(
+                name='html-title',
+                output=re.compile('Outlook Web A|(Requested resource was|'
+                                  'Did not follow redirect to ).*'
+                                  '/(owa|exchweb)', flags=re.I),
+            ),
         )
 
     def searchxp445(self):
@@ -422,16 +505,21 @@ class DBNmap(DB):
         )
 
     def searchypserv(self):
-        return self.searchscriptidout('rpcinfo', re.compile('ypserv', flags=0))
+        return self.searchscript(name='rpcinfo',
+                                 output=re.compile('ypserv', flags=0))
 
     def searchnfs(self):
-        return self.searchscriptidout('rpcinfo', re.compile('nfs', flags=0))
+        return self.searchscript(name='rpcinfo',
+                                 output=re.compile('nfs', flags=0))
 
     def searchtorcert(self):
-        return self.searchscriptidout(
-            'ssl-cert',
-            re.compile('^Subject: CN=www\\.[a-z2-7]{8,20}\\.(net|com)($|\n)',
-                       flags=0))
+        return self.searchscript(
+            name='ssl-cert',
+            output=re.compile(
+                '^Subject: CN=www\\.[a-z2-7]{8,20}\\.(net|com)($|\n)',
+                flags=0,
+            ),
+        )
 
     def searchgeovision(self):
         return self.searchproduct(re.compile('^GeoVision', re.I))
@@ -440,15 +528,7 @@ class DBNmap(DB):
         return self.searchdevicetype('webcam')
 
     @staticmethod
-    def searchscriptidout(name, output):
-        raise NotImplementedError
-
-    @staticmethod
-    def searchscriptid(name):
-        raise NotImplementedError
-
-    @staticmethod
-    def searchhostscriptidout(name, out):
+    def searchscript(host=False, name=None, output=None, values=None):
         raise NotImplementedError
 
     @staticmethod
@@ -629,8 +709,8 @@ class DBAgent(DB):
         if not remotepath.endswith('/'):
             remotepath += '/'
         if source is None:
-            source = ("" if host is None
-                      else "%s:" % host) + remotepath
+            source = (remotepath if host is None
+                      else "%s:%s" % (host, remotepath))
         master = self.get_master(masterid)
         localpath = tempfile.mkdtemp(prefix="", dir=master['path'])
         for dirname in ["input"] + [os.path.join("remote", dname)
@@ -976,16 +1056,16 @@ class MetaDB(object):
 
     @staticmethod
     def url2dbinfos(url):
-        url = urlparse.urlparse(url)
+        url = urllib.parse.urlparse(url)
         userinfo = {}
         if '@' in url.netloc:
             username = url.netloc[:url.netloc.index('@')]
             if ':' in username:
                 userinfo = dict(zip(["username", "password"],
-                                    map(urllib.unquote,
+                                    map(urllib.parse.unquote,
                                         username.split(':', 1))))
             else:
-                username = urllib.unquote(username)
+                username = urllib.parse.unquote(username)
                 if username == 'GSSAPI':
                     import krbV
                     userinfo = {

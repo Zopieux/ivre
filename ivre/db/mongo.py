@@ -245,7 +245,7 @@ class MongoDB(DB):
 
     @staticmethod
     def flt_or(*args):
-        return {'$or': args}
+        return {'$or': args} if len(args) > 1 else args[0]
 
     @staticmethod
     def searchid(idval, neg=False):
@@ -313,6 +313,7 @@ class MongoDBNmap(MongoDB, DBNmap):
 
     content_handler = xmlnmap.Nmap2Mongo
     needunwind = ["categories", "ports", "ports.scripts", "scripts",
+                  "scripts.smb-enum-shares.shares",
                   "extraports.filtered", "traces", "traces.hops",
                   "os.osmatch", "os.osclass", "hostnames",
                   "hostnames.domains"]
@@ -361,6 +362,16 @@ class MongoDBNmap(MongoDB, DBNmap):
                 [('source', pymongo.ASCENDING)],
             ],
         }
+        self.specialindexes = {
+            self.colname_hosts: [
+                ([('ports.screenshot', pymongo.ASCENDING)],
+                 {"sparse": True}),
+            ],
+            self.colname_oldhosts: [
+                ([('ports.screenshot', pymongo.ASCENDING)],
+                 {"sparse": True}),
+            ],
+        }
 
     def init(self):
         """Initializes the "active" columns, i.e., drops those columns and
@@ -395,6 +406,48 @@ have no effect if it is not expected)."""
         return self.db[self.colname_scans].find_one(
             {'_id': scanid}, **kargs)
 
+    def getscreenshot(self, port):
+        """Returns the content of a port's screenshot."""
+        url = port.get('screenshot')
+        if url is None:
+            return None
+        if url == "field":
+            return port.get('screendata')
+
+    def setscreenshot(self, host, port, data, protocol='tcp',
+                      archives=False, overwrite=False):
+        """Sets the content of a port's screenshot."""
+        try:
+            port = [p for p in host.get('ports', [])
+                    if p['port'] == port and p['protocol'] == protocol][0]
+        except IndexError:
+            raise KeyError("Port %s/%d does not exist" % (protocol, port))
+        if 'screenshot' in port and not overwrite:
+            return
+        port['screenshot'] = "field"
+        port['screendata'] = bson.Binary(data)
+        self.db[
+            self.colname_oldhosts if archives else self.colname_hosts
+        ].update({"_id": host['_id']}, {"$set": {'ports': host['ports']}})
+
+    def removescreenshot(self, host, port=None, protocol='tcp',
+                         archives=False):
+        """Removes screenshots"""
+        changed = False
+        for p in host.get('ports', []):
+            if port is None or (p['port'] == port and
+                                p['protocol'] == protocol):
+                if 'screenshot' in p:
+                    if p['screenshot'] == "field":
+                        if 'screendata' in p:
+                            del p['screendata']
+                    del p['screenshot']
+                    changed = True
+        if changed:
+            self.db[
+                self.colname_oldhosts if archives else self.colname_hosts
+            ].update({"_id": host["_id"]}, {"$set": {'ports': host['ports']}})
+
     def getlocations(self, flt, archive=False):
         col = self.db[self.colname_oldhosts if archive else self.colname_hosts]
         pipeline = [
@@ -404,6 +457,16 @@ have no effect if it is not expected)."""
             {"$sort": {"count": -1}},
         ]
         return col.aggregate(pipeline)['result']
+
+    def is_scan_present(self, scanid):
+        for colname in [self.colname_scans, self.colname_oldscans]:
+            if self.db[colname].find_one({"_id": scanid},
+                                         fields=[]) is not None:
+                return True
+        return False
+
+    def store_host(self, host):
+        self.db[self.colname_hosts].insert(host)
 
     def remove(self, host, archive=False):
         """Removes the host "host" from the active (the old one if
@@ -426,6 +489,64 @@ have no effect if it is not expected)."""
         if scanid is not None and self.get(
                 {'scanid': scanid}, archive=archive).count() == 0:
             self.db[colname_scans].remove(spec_or_id=scanid)
+
+    def archive(self, host):
+        """Archives a given host record. Also archives the
+        corresponding scan and removes the scan from the "not
+        archived" scan collection if not there is no host left in the
+        "not archived" host collumn.
+
+        """
+        if self.db[self.colname_hosts].find_one({"_id": host['_id']}) is None:
+            if config.DEBUG:
+                print("WARNING: cannot archive: host %s does not exist"
+                      " in %r" % (host['_id'], self.colname_hosts))
+        # store the host in the archive hosts collection
+        self.db[self.colname_oldhosts].insert(host)
+        if config.DEBUG:
+            print "HOST ARCHIVED: %s in %r" % (
+                host['_id'],
+                self.colname_oldhosts,
+            )
+        # remove the host from the (not archived) hosts collection
+        self.db[self.colname_hosts].remove(spec_or_id=host['_id'])
+        if config.DEBUG:
+            print "HOST REMOVED: %s from %r" % (
+                host['_id'],
+                self.colname_hosts,
+            )
+        scanid = host.get('scanid')
+        if scanid is not None:
+            scan = self.db[self.colname_scans].find_one({'_id': scanid})
+            if scan is not None:
+                # store the scan in the archive scans collection if it
+                # is not there yet
+                if self.db[self.colname_oldscans].find_one(
+                        {'_id': scanid}) is None:
+                    self.db[self.colname_oldscans].insert(scan)
+                    if config.DEBUG:
+                        print "SCAN ARCHIVED: %s in %r" % (
+                            scanid,
+                            self.colname_oldscans,
+                        )
+                # remove the scan from the (not archived) scans
+                # collection if there is no more hosts related to this
+                # scan in the hosts collection
+                if self.db[self.colname_hosts].find_one(
+                        {'scanid': scanid}) is None:
+                    self.db[self.colname_scans].remove(spec_or_id=scanid)
+                    if config.DEBUG:
+                        print "SCAN REMOVED: %s in %r" % (
+                            scanid,
+                            self.colname_scans,
+                        )
+
+    def archive_from_func(self, host, gettoarchive):
+        if gettoarchive is None:
+            return
+        for rec in gettoarchive(self.db[self.colname_hosts],
+                                host['addr'], host['source']):
+            self.archive(rec)
 
     def get_mean_open_ports(self, flt, archive=False):
         """This method returns for a specific query `flt` a list of
@@ -509,6 +630,20 @@ have no effect if it is not expected)."""
             self.colname_oldhosts if archive
             else self.colname_hosts
         ].aggregate(aggr)['result']
+
+    @staticmethod
+    def json2dbrec(host):
+        for fname in ["starttime", "endtime"]:
+            if fname in host:
+                host[fname] = datetime.datetime.strptime(
+                    host[fname], "%Y-%m-%d %H:%M:%S"
+                )
+        for port in host.get('ports', []):
+            if 'screendata' in port:
+                port['screendata'] = bson.Binary(
+                    port['screendata'].decode('base64')
+                )
+        return host
 
     @staticmethod
     def searchdomain(name, neg=False):
@@ -633,6 +768,14 @@ have no effect if it is not expected)."""
             'state_state': state
         }}}
 
+    def searchportsother(self, ports, protocol='tcp', state='open'):
+        """Filters records with at least one port other than those
+        listed in `ports` with state `state`.
+
+        """
+        return self.searchport({'$nin': ports}, protocol=protocol,
+                               state=state)
+
     def searchports(self, ports, protocol='tcp', state='open', neg=False):
         return self.flt_and(*(self.searchport(p, protocol=protocol,
                                               state=state, neg=neg)
@@ -678,29 +821,53 @@ have no effect if it is not expected)."""
         return {'ports': {'$elemMatch': flt}}
 
     @staticmethod
-    def searchscriptidout(name, output):
-        """Search a particular content in the scripts names and
+    def searchscript(host=False, name=None, output=None, values=None):
+        """Search a particular content in the scripts results.
+
+        """
+        key = "scripts" if host else "ports.scripts"
+        req = {}
+        if name is not None:
+            req['id'] = name
+        if output is not None:
+            req['output'] = output
+        if values is not None:
+            if name is None:
+                raise TypeError(".searchscript() needs a `name` arg "
+                                "when using a `values` arg")
+            for field, value in values.iteritems():
+                req["%s.%s" % (name, field)] = value
+        if not req:
+            return {key: {"$exists": True}}
+        if len(req) == 1:
+            field, value = req.items()[0]
+            return {"%s.%s" % (key, field): value}
+        return {key: {"$elemMatch": req}}
+
+    def searchscriptidout(self, name, output):
+        """DEPRECATED: use .searchscript() instead.
+
+        Search a particular content in the scripts names and
         outputs.
 
         """
-        return {
-            'ports.scripts': {'$elemMatch': {
-                'id': name,
-                'output': output
-            }}}
+        return self.searchscript(name=name, output=output)
 
-    @staticmethod
-    def searchscriptid(name):
-        """Search a script name."""
-        return {'ports.scripts.id': name}
+    def searchscriptid(self, name):
+        """DEPRECATED: use .searchscript() instead.
 
-    @staticmethod
-    def searchscriptoutput(expr):
-        """Search a particular content in the scripts names and
-        outputs.
+        Search a script name.
 
         """
-        return {'ports.scripts.output': expr}
+        return self.searchscript(name=name)
+
+    def searchscriptoutput(self, expr):
+        """DEPRECATED: use .searchscript() instead.
+
+        Search a particular content in the scripts outputs.
+
+        """
+        return self.searchscript(output=expr)
 
     @staticmethod
     def searchsvchostname(srv):
@@ -745,15 +912,46 @@ have no effect if it is not expected)."""
     def searchfile(self, fname):
         if type(fname) is not utils.REGEXP_T:
             fname = re.compile(re.escape(fname))
-        return self.searchscriptidout(
-            {'$in': ['ftp-anon', 'afp-ls', 'gopher-ls',
-                     'http-vlcstreamer-ls', 'nfs-ls', 'smb-ls']},
-            fname)
+        return self.searchscript(
+            name={'$in': ['ftp-anon', 'afp-ls', 'gopher-ls',
+                          'http-vlcstreamer-ls', 'nfs-ls', 'smb-ls']},
+            output=fname,
+        )
+
+    def searchsmbshares(self, access='', hidden=None):
+        """Filter SMB shares with anonymous `access` (default: either
+        read or write, accepted values 'r', 'w', 'rw').
+
+        If `hidden` is set to `True`, look for hidden shares, for
+        non-hidden if set to `False` and for both if set to `None`
+        (this is the default).
+
+        """
+        access = {
+            '': re.compile('^(READ|WRITE)'),
+            'r': re.compile('^READ(/|$)'),
+            'w': re.compile('(^|/)WRITE$'),
+            'rw': 'READ/WRITE',
+            'wr': 'READ/WRITE',
+        }[access.lower()]
+        share_type = {
+            None: re.compile('^STYPE_DISKTREE(_HIDDEN)?'),
+            True: 'STYPE_DISKTREE_HIDDEN',
+            False: 'STYPE_DISKTREE',
+        }[hidden]
+        return self.searchscript(
+            name='smb-enum-shares',
+            values={'shares': {'$elemMatch': {
+                'Anonymous access': access,
+                'Type': share_type,
+            }}},
+            host=True)
 
     def searchhttptitle(self, title):
-        return self.searchscriptidout(
-            {'$in': ['http-title', 'html-title']},
-            title)
+        return self.searchscript(
+            name={'$in': ['http-title', 'html-title']},
+            output=title,
+        )
 
     @staticmethod
     def searchservicescript(srv, port=None):
@@ -788,22 +986,17 @@ have no effect if it is not expected)."""
                     ]
                 }}}
 
-    @staticmethod
-    def searchhostscript(txt):
-        return {'scripts.output': txt}
+    def searchhostscript(self, txt):
+        """DEPRECATED: use .searchscript() instead."""
+        return self.searchscript(host=True, output=txt)
 
-    @staticmethod
-    def searchhostscriptid(name):
-        return {'scripts.id': name}
+    def searchhostscriptid(self, name):
+        """DEPRECATED: use .searchscript() instead."""
+        return self.searchscript(host=True, name=name)
 
-    @staticmethod
-    def searchhostscriptidout(name, out):
-        return {
-            'scripts': {
-                '$elemMatch': {
-                    'id': name,
-                    'output': out
-                }}}
+    def searchhostscriptidout(self, name, out):
+        """DEPRECATED: use .searchscript() instead."""
+        return self.searchscript(host=True, name=name, output=out)
 
     @staticmethod
     def searchos(txt):
@@ -918,6 +1111,32 @@ have no effect if it is not expected)."""
             {'traces.hops.host': hop},
         )
 
+    @staticmethod
+    def searchscreenshot(port=None, protocol='tcp', service=None, neg=False):
+        """Filter results with (without, when `neg == True`) a
+        screenshot (on a specific `port` if specified).
+
+        """
+        if port is None and service is None:
+            return {'ports.screenshot': {'$exists': not neg}}
+        if port is None:
+            return {'ports': {
+                '$elemMatch': {'service_name': service,
+                               'screenshot': {'$exists': not neg}}
+            }}
+        if service is None:
+            return {'ports': {
+                '$elemMatch': {'port': port,
+                               'protocol': protocol,
+                               'screenshot': {'$exists': not neg}}
+            }}
+        return {'ports': {
+            '$elemMatch': {'port': port,
+                           'protocol': protocol,
+                           'service_name': service,
+                           'screenshot': {'$exists': not neg}}
+        }}
+
     def topvalues(self, field, flt=None, topnbr=10, sortby=None,
                   limit=None, skip=None, least=False, archive=False,
                   aggrflt=None, specialproj=None, specialflt=None,
@@ -1007,8 +1226,13 @@ have no effect if it is not expected)."""
                 {"$project": {"ports.port": 1, "ports.state_state": 1}},
                 # if the host has no ports attribute, we create an empty list
                 {"$project": {"ports": {"$ifNull": ["$ports", []]}}},
-                # we use $redact instead of $match to keep an empty
-                # list when no port matches
+                # We use $redact instead of $match to keep an empty
+                # list when no port matches.
+                #
+                # The firts "$cond" help us make the difference
+                # between main document ($ports exists in that case)
+                # and a nested document ($ports does not exist in that
+                # case). The second only keeps ports we are interested in.
                 {"$redact": {"$cond": {"if": {"$eq": [{"$ifNull": ["$ports",
                                                                    None]},
                                                       None]},
@@ -1026,16 +1250,25 @@ have no effect if it is not expected)."""
             ]
             field = "portlist"
         elif field.startswith('countports:'):
-            # specialproj = {"_id": 0, "ports.port": 1,
-            #                "ports.state_state": 1}
-            # specialflt = [
-            #     {"$match": {"ports.state_state":
-            #                 field.split(':', 1)[1]}},
-            #     {"$project": {"ports.port": 1}},
-            #     {"$group": {"_id": "$ports.port",
-            #                 "countports": {"$sum": 1}}},
-            # ]
-            # field = "countports"
+            specialproj = {"_id": 0,
+                           "ports.state_state": 1}
+            specialflt = [
+                {"$project": {"ports": {"$ifNull": ["$ports", []]}}},
+                # See "portlist:".
+                {"$redact": {"$cond": {"if": {"$eq": [{"$ifNull": ["$ports",
+                                                                   None]},
+                                                      None]},
+                                       "then": {
+                                           "$cond": {
+                                               "if": {"$eq": [
+                                                   "$state_state",
+                                                   field.split(':', 1)[1]]},
+                                               "then": "$$KEEP",
+                                               "else": "$$PRUNE"}},
+                                       "else": "$$DESCEND"}}},
+                {"$project": {"countports": {"$size": "$ports"}}},
+            ]
+            field = "countports"
             pass
         elif field == "service":
             flt = self.flt_and(flt, self.searchopenport())
@@ -1201,7 +1434,7 @@ have no effect if it is not expected)."""
             field = "ports.service_devicetype"
         elif field.startswith('smb.'):
             flt = self.flt_and(
-                flt, self.searchhostscriptid('smb-os-discovery')
+                flt, self.searchscript(host=True, name='smb-os-discovery')
             )
             if field == 'smb.dnsdomain':
                 field = 'scripts.smb-os-discovery.domain_dns'
@@ -1320,6 +1553,8 @@ have no effect if it is not expected)."""
             )
         if args.net is not None:
             flt = self.flt_and(flt, self.searchnet(args.net))
+        if args.range is not None:
+            flt = self.flt_and(flt, self.searchrange(*args.range))
         if args.hop is not None:
             flt = self.flt_and(flt, self.searchhop(args.hop))
         if args.port is not None:
@@ -1332,6 +1567,17 @@ have no effect if it is not expected)."""
             flt = self.flt_and(
                 flt,
                 self.searchport(port=port, protocol=proto))
+        if args.not_port is not None:
+            not_port = args.not_port.replace('_', '/')
+            if '/' in not_port:
+                not_proto, not_port = not_port.split('/', 1)
+            else:
+                not_proto = 'tcp'
+            not_port = int(not_port)
+            flt = self.flt_and(
+                flt,
+                self.searchport(port=not_port, protocol=not_proto,
+                                neg=True))
         if args.openport:
             flt = self.flt_and(flt, self.searchopenport())
         if args.no_openport:
@@ -1342,19 +1588,21 @@ have no effect if it is not expected)."""
                 self.searchservicescript(utils.str2regexp(args.service)))
         if args.script is not None:
             if ':' in args.script:
-                flt = self.flt_and(
-                    flt,
-                    self.searchscriptidout(map(utils.str2regexp,
-                                               args.script.split(':', 1)))
-                )
-                flt = self.flt_and(
-                    flt,
-                    self.searchscriptid(utils.str2regexp(args.script))
-                )
+                name, output = (utils.str2regexp(string) for
+                                string in args.script.split(':', 1))
+            else:
+                name, output = utils.str2regexp(args.script), None
+            flt = self.flt_and(flt, self.searchscript(name=name,
+                                                      output=output))
         if args.hostscript is not None:
-            flt = self.flt_and(
-                flt,
-                self.searchhostscript(utils.str2regexp(args.hostscript)))
+            if ':' in args.hostscript:
+                name, output = (utils.str2regexp(string) for
+                                string in args.hostscript.split(':', 1))
+            else:
+                name, output = utils.str2regexp(args.hostscript), None
+            flt = self.flt_and(flt, self.searchscript(host=True,
+                                                      name=name,
+                                                      output=output))
         if args.svchostname is not None:
             flt = self.flt_and(
                 flt,

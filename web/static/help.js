@@ -148,7 +148,7 @@ var HELP = {
 	"content": "Look for MS-SQL servers with an empty password for the <code>sa</code> account.",
     },
     "mysqlemptypwd": {
-	"title": "mssqlemptypwd",
+	"title": "mysqlemptypwd",
 	"content": "Look for MySQL servers with an empty password for the <code>root</code> account.",
     },
     "owa": {
@@ -190,6 +190,10 @@ var HELP = {
     "smb.workgroup:": {
 	"title": "smb.workgroup:[NetBIOS]",
 	"content": "Search results with SMB service in a specific workgroup (NetBIOS).",
+    },
+    "smbshare": {
+	"title": "smbshare<b>(:[access mode])</b>",
+	"content": "Search results with SMB shares with anonymous access. Access can be 'r', 'w' or 'rw' (default is read or write).",
     },
     "sshkey:": {
 	"title": "sshkey:<b>[fingerprint or base64]</b>",
@@ -251,8 +255,8 @@ var HELP = {
 	"content": "Look for results with a hostname within a matching domain name in the Traceroute result ([FQDN] can be specified as a string or a regexp).",
     },
     "tcp/": {
-	"title": "<b>(!)[port number]</b> or <b>(!)</b>tcp/<b>[port number]</b>",
-	"content": "Look for results with the specified TCP port open.",
+	"title": "<b>(!)[port number](,[port number](,...))</b> or <b>(!)</b>tcp/<b>[port number]</b>",
+	"content": "Look for results with the specified TCP port(s) open.",
     },
     "udp/": {
 	"title": "<b>(!)</b>udp/<b>[port number]</b>",
@@ -261,6 +265,14 @@ var HELP = {
     "openport": {
 	"title": "<b>(!)</b>openport",
 	"content": "Look for hosts with at least one open port.",
+    },
+    "otheropenport:": {
+	"title": "otheropenport:<b>[port number](,[port number](,...))</b>",
+	"content": "Look for hosts with at least one open port other than those listed.",
+    },
+    "screenshot": {
+	"title": "<b>(!)</b>screenshot<b>(:[port number])</b>",
+	"content": "Search results with at least one screenshot.",
     },
     "notes": {
 	"title": "notes",
@@ -287,6 +299,10 @@ var HELP = {
     "display:script:": {
 	"title": "display:script:<b>[script id]</b>",
 	"content": "Display only a particular script output.",
+    },
+    "display:screenshot": {
+	"title": "display:screenshot",
+	"content": "Display only screenshots.",
     },
 };
 

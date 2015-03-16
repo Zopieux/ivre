@@ -25,17 +25,19 @@ This sub-module contains functions that might be usefull to any other
 sub-module or script.
 """
 
-import struct
-import socket
-import datetime
-import re
-import os
-import sys
-import shutil
-import errno
-import stat
-import hashlib
 from six import iteritems
+import bz2
+import datetime
+import errno
+import gzip
+import hashlib
+import os
+import re
+import shutil
+import socket
+import stat
+import struct
+import sys
 
 # (1)
 # http://docs.mongodb.org/manual/core/indexes/#index-behaviors-and-limitations
@@ -412,6 +414,26 @@ def doc2csv(doc, fields, nastr="NA"):
     return lines
 
 
+def open_file(fname):
+    """Returns an open file-like object, working with gzip or bzip2
+    compressed files.
+
+    """
+    return {
+        "bz2": bz2.BZ2File,
+        "gz": gzip.open,
+    }.get(os.path.basename(fname).split('.')[-1], open)(fname)
+
+
+def hash_file(fname, hashtype="sha1"):
+    """Compute a hash of data from a given file"""
+    result = hashlib.new(hashtype)
+    with open_file(fname) as fdesc:
+        for data in iter(lambda: fdesc.read(1048576), ""):
+            result.update(data)
+        return result
+
+
 class FakeArgparserParent(object):
     """This is a stub to implement a parent-like behavior when
     optparse has to be used.
@@ -436,7 +458,7 @@ if sys.version_info[0] == 3:
     def hash_value(value, hashtype="sha1"):
         return hashlib.new(
             hashtype,
-            value.encode()  if type(value) is str else value
+            value.encode() if type(value) is str else value
         )
 
     def base64_decode(value):

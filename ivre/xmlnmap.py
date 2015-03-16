@@ -28,7 +28,6 @@ This sub-module contains the parser for nmap's XML output files.
 from ivre import utils
 
 from xml.sax.handler import ContentHandler, EntityResolver
-import hashlib
 import datetime
 import sys
 import os
@@ -43,11 +42,32 @@ ADD_TABLE_ELEMS = {
     re.compile('^ *DEVICE IDENTIFICATION: *(?P<deviceid>.*?) *$', re.M),
 }
 
+
+def change_smb_enum_shares(table):
+    """Adapt structured data from script smb-enum-shares so that it is
+    easy to query when inserted in DB.
+
+    """
+    if not table:
+        return table
+    result = {}
+    for field in ["account_used", "note"]:
+        if field in table:
+            result[field] = table.pop(field)
+    result["shares"] = []
+    for key, value in table.iteritems():
+        value.update({"Share": key})
+        result["shares"].append(value)
+    return result
+
+CHANGE_TABLE_ELEMS = {
+    'smb-enum-shares': change_smb_enum_shares,
+}
+
 IGNORE_SCRIPTS = {
     'mcafee-epo-agent': set(['ePO Agent not found']),
     'ftp-bounce': set(['no banner']),
     'telnet-encryption': set(['\n  ERROR: Failed to send packet: TIMEOUT']),
-    'ssh-hostkey': set(['\n']),
     'http-mobileversion-checker': set(['No mobile version detected.']),
     'http-referer-checker': set(["Couldn't find any cross-domain scripts."]),
     'http-default-accounts': set([
@@ -74,14 +94,23 @@ IGNORE_SCRIPTS = {
         '\n  ERROR: Failed to connect to AJP server',
     ]),
     'giop-info': set(['  \n  ERROR: Failed to read Packet.GIOP']),
-    'rsync-list-modules': set(['\n  ERROR: Failed to '
-                               'connect to rsync server']),
+    'rsync-list-modules': set([
+        '\n  ERROR: Failed to connect to rsync server',
+        '\n  ERROR: Failed to retrieve a list of modules',
+    ]),
     'sip-methods': set(['ERROR: Failed to connect to the SIP server.']),
+    'sip-call-spoof': set(['ERROR: Failed to connect to the SIP server.']),
     'rpcap-info': set(['\n  ERROR: EOF']),
+    'rmi-dumpregistry': set(['Registry listing failed (Handshake failed)']),
+    'voldemort-info': set(['\n  ERROR: Unsupported protocol']),
     'irc-botnet-channels': set(['\n  ERROR: EOF\n']),
-    'bitcoin-getaddr': set(['\n  ERROR: Failed to extract version '
-                            'information']),
+    'bitcoin-getaddr': set([
+        '\n  ERROR: Failed to extract address information',
+        '\n  ERROR: Failed to extract version information',
+    ]),
     'bitcoin-info': set(['\n  ERROR: Failed to extract version information']),
+    'drda-info': set(['The response contained no EXCSATRD']),
+    'rdp-enum-encryption': set(['Received unhandled packet']),
     'ldap-search': set(['ERROR: Failed to bind as the anonymous user']),
     # host scripts
     'firewalk': set(['None found']),
@@ -108,6 +137,18 @@ IGNORE_SCRIPTS_REGEXP = {
     'ms-sql-hasdbaccess': MSSQL_ERROR,
     'ms-sql-query': MSSQL_ERROR,
     'ms-sql-tables': MSSQL_ERROR,
+    'irc-botnet-channels': re.compile(
+        "^" + re.escape("\n  ERROR: Closing Link: ")
+    ),
+    'http-php-version': re.compile(
+        '^(Logo query returned unknown hash [0-9a-f]{32}\\\n'
+        'Credits query returned unknown hash [0-9a-f]{32}|'
+        '(Logo|Credits) query returned unknown hash '
+        '[0-9a-f]{32})$'
+    ),
+    'p2p-conficker': re.compile(
+        re.escape('Host is CLEAN or ports are blocked')
+    ),
 }
 
 IGNORE_SCRIPT_OUTPUTS = set([
@@ -115,6 +156,8 @@ IGNORE_SCRIPT_OUTPUTS = set([
     'false',
     'TIMEOUT',
     'ERROR',
+    '\n',
+    '\r\n',
 ])
 
 IGNORE_SCRIPT_OUTPUTS_REGEXP = set([
@@ -174,7 +217,7 @@ class NmapHandler(ContentHandler):
 
     """
 
-    def __init__(self, fname, needports=False, **_):
+    def __init__(self, fname, filehash, needports=False, **_):
         ContentHandler.__init__(self)
         self._needports = needports
         self._curscan = None
@@ -187,12 +230,8 @@ class NmapHandler(ContentHandler):
         self._curtable = {}
         self._curtablepath = []
         self._curhostnames = None
-        with open(fname) as fdesc:
-            self._filehash = utils.hash_value(fdesc.read(),
-                                              "sha256").hexdigest()
+        self._filehash = filehash
         print("READING %r (%r)" % (fname, self._filehash))
-        if self._isscanpresent():
-            raise Exception('Scan already present in Database.')
 
     def _addhost(self, _):
         """Subclasses may store host (first argument) here."""
@@ -205,13 +244,6 @@ class NmapHandler(ContentHandler):
     def _addscaninfo(self, _):
         """Subclasses may add scan information (first argument) to
         self._curscan here.
-
-        """
-        pass
-
-    def _isscanpresent(self):
-        """Subclasses may check whether a scan is already present in
-        the database here.
 
         """
         pass
@@ -240,7 +272,7 @@ class NmapHandler(ContentHandler):
                 self._curhost[attr] = attrs[attr]
             for field in ['starttime', 'endtime']:
                 if field in self._curhost:
-                    self._curhost[field] = datetime.datetime.fromtimestamp(
+                    self._curhost[field] = datetime.datetime.utcfromtimestamp(
                         int(self._curhost[field])
                     )
         elif name == 'address' and self._curhost is not None:
@@ -458,11 +490,13 @@ class NmapHandler(ContentHandler):
                 if self._curtablepath:
                     sys.stderr.write("WARNING, self._curtablepath should be "
                                      "empty, got [%r]\n" % self._curtablepath)
+                if infokey in CHANGE_TABLE_ELEMS:
+                    self._curtable = CHANGE_TABLE_ELEMS[infokey](self._curtable)
                 self._curscript[infokey] = self._curtable
                 self._curtable = {}
             elif infokey != 'infos' and infokey in ADD_TABLE_ELEMS:
                 infos = ADD_TABLE_ELEMS[infokey]
-                if type(infos) is utils.REGEXP_T:
+                if isinstance(infos, utils.REGEXP_T):
                     infos = infos.search(self._curscript.get('output', ''))
                     if infos is not None:
                         infosdict = infos.groupdict()
@@ -534,8 +568,8 @@ class Nmap2Mongo(NmapHandler):
 
     """Specific handler for MongoDB backend."""
 
-    def __init__(self, fname, needports=False, categories=None,
-                 source=None, gettoarchive=None, add_addr_infos=True):
+    def __init__(self, fname, categories=None, source=None,
+                 gettoarchive=None, add_addr_infos=True, **kargs):
         from ivre import db
         self._db = db.db
         if categories is None:
@@ -548,18 +582,13 @@ class Nmap2Mongo(NmapHandler):
         # rename this class as Nmap2DB
         self._collection = self._db.nmap.db[self._db.nmap.colname_hosts]
         self._scancollection = self._db.nmap.db[self._db.nmap.colname_scans]
-        self._archivescollection = self._db.nmap.db[
-            self._db.nmap.colname_oldhosts]
-        self._archivesscancollection = self._db.nmap.db[
-            self._db.nmap.colname_oldscans]
         if gettoarchive is None:
             self._gettoarchive = lambda c, a, s: []
         else:
             self._gettoarchive = gettoarchive
-        NmapHandler.__init__(self, fname, needports=needports,
-                             categories=categories, source=source,
-                             gettoarchive=gettoarchive,
-                             add_addr_infos=add_addr_infos)
+        NmapHandler.__init__(self, fname, categories=categories,
+                             source=source, gettoarchive=gettoarchive,
+                             add_addr_infos=add_addr_infos, **kargs)
 
     def _addhost(self, host):
         if self.categories:
@@ -576,37 +605,9 @@ class Nmap2Mongo(NmapHandler):
             host['source'] = self.source
         for rec in self._gettoarchive(self._collection, host['addr'],
                                       self.source):
-            self._archiverecord(rec)
+            self._db.nmap.archive(rec)
         ident = self._collection.insert(host)
         print("HOST STORED: %r in %r" % (ident, self._collection))
-
-    def _archiverecord(self, host):
-        """Archives a given host record. Also archives the
-        corresponding scan and removes the scan from the "not
-        archived" scan collection if not there is no host left in the
-        "not archived" host collumn.
-
-        """
-        # store the host in the archive hosts collection
-        self._archivescollection.insert(host)
-        print("HOST ARCHIVED: %r in %r" % (host['_id'],
-                                           self._archivescollection))
-        scanid = host['scanid']
-        # store the scan in the archive scans collection if it is not there yet
-        if self._archivesscancollection.find_one(
-                {'_id': host['scanid']}) is None:
-            self._archivesscancollection.insert(
-                self._scancollection.find({'_id': scanid})[0])
-            print("SCAN ARCHIVED: %r in %r" % (scanid,
-                                               self._archivesscancollection))
-        # remove the host from the hosts collection
-        self._collection.remove(spec_or_id=host['_id'])
-        print("HOST REMOVED: %r from %r" % (host['_id'], self._collection))
-        # remove the scan from the scans collection if there is no
-        # more hosts related to this scan in the hosts collection
-        if self._collection.find({'scanid': scanid}).count() == 0:
-            self._scancollection.remove(spec_or_id=scanid)
-            print("SCAN REMOVED: %r from %r" % (scanid, self._scancollection))
 
     def _storescan(self):
         res = self._scancollection.insert(self._curscan)
@@ -620,6 +621,3 @@ class Nmap2Mongo(NmapHandler):
             self._curscan['scaninfos'].append(i)
         else:
             self._curscan['scaninfos'] = [i]
-
-    def _isscanpresent(self):
-        return self._scancollection.find({'_id': self._filehash}).count() > 0

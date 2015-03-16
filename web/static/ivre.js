@@ -796,14 +796,25 @@ function build_chart(chart, field, dataset) {
 	    return 'setparam("' + field.substr(5) + '", "' + x + '");';
 	};
     }
-    else if(field.substr(0, 7) === 'service') {
+    else if(field === 'service') {
 	preparefilter = function(x) {
 	    return 'setparam("service", "' + x + '");';
 	};
     }
-    else if(field.substr(0, 13) === 'probedservice') {
+    else if(field.substr(0, 8) === 'service:') {
+	preparefilter = function(x) {
+	    return 'setparam("service", "' + x + ':' + field.substr(8) + '");';
+	};
+    }
+    else if(field === 'probedservice') {
 	preparefilter = function(x) {
 	    return 'setparam("probedservice", "' + x + '");';
+	};
+    }
+    else if(field.substr(0, 14) === 'probedservice:') {
+	preparefilter = function(x) {
+	    return 'setparam("probedservice", "' + x + ':' +
+		field.substr(14) + '");';
 	};
     }
     else if(field.substr(0, 7) === 'product') {
@@ -1268,6 +1279,10 @@ function add_param_objects(p, pp) {
     else if (p.substr(0, 7) === 'cookie:')
 	add_param_object(parametersobjunalias, 'script',
 			 [b, 'http-headers:/Set-Cookie: ' + p.substr(7) + '=/']);
+    else if (p.substr(0, 8) === 'smbshare' && (p.length === 8 ||
+					       p.substr(8, 1) === ':'))
+	add_param_object(parametersobjunalias, 'hostscript',
+			 [b, 'smb-enum-shares:/READ|WRITE|STYPE_DISKTREE/']);
     else if (p.substr(0, 4) === 'smb.') {
 	/*
 	 * smb.* filters are very specific: they rely on the
@@ -1768,7 +1783,7 @@ ivreWebUi
 	    // ports
 	    "port", "port:open", "port:closed", "port:filtered",
 	    // countports / portlist
-	    //"countports:open", "countports:filtered", "countports:closed",
+	    "countports:open", "countports:filtered", "countports:closed",
 	    "portlist:open", "portlist:closed", "portlist:filtered",
 	    // service, products, etc. [:port]
 	    "service", "service:",
@@ -1933,6 +1948,11 @@ ivreWebUi
 	    templateUrl: 'templates/view-scripts-only.html'
 	};
     })
+    .directive('displayScreenshot', function() {
+	return {
+	    templateUrl: 'templates/view-screenshots-only.html'
+	};
+    })
     .directive('hostSummary', function() {
 	return {
 	    templateUrl: 'templates/subview-host-summary.html'
@@ -2077,20 +2097,34 @@ function set_tooltip_filter(elt) {
        (elt.value.length > 1 || "!-".indexOf(elt.value[0]) === -1)) {
 	var matching_keys = Object.keys(HELP).filter(
 	    function(key) {
-		return (':/'.indexOf(key.slice(-1)) === -1 ?
+		return ((':/'.indexOf(key.slice(-1)) === -1
+			 && key !== 'screenshot'
+			 && key !== 'smbshare') ?
 			elt.value === key.substr(0, elt.value.length) :
 			elt.value.substr(0, key.length) === key.substr(0, elt.value.length));
 	    }
 	);
+	var oldval = elt.getAttribute("oldval");
+	if(oldval === null)
+	    oldval = "";
 	if(matching_keys.length == 1) {
 	    key = matching_keys[0];
 	    content = HELP[key];
 	    if(elt.getAttribute('data-title') !== content.title) {
 		set_tooltip(elt, content);
-		if(elt.value.length < key.length) {
-		    elt.value = key;
-		}
 	    }
+	    if(oldval.length < elt.value.length &&
+	       elt.value.substr(0, oldval.length) === oldval &&
+	       elt.value.length < key.length) {
+		var start = elt.value.length;
+		oldval = elt.value;
+		elt.value = key;
+		elt.selectionStart = start;
+	    }
+	    else {
+		oldval = elt.value;
+	    }
+	    elt.setAttribute("oldval", oldval);
 	    return;
 	}
 	if(matching_keys.length >= 2) {
@@ -2109,13 +2143,23 @@ function set_tooltip_filter(elt) {
 	    if(elt.getAttribute('data-title') !== content.title ||
 	       elt.getAttribute('data-content') !== content.content) {
 		set_tooltip(elt, content);
-		if(elt.value.length < key.length) {
-		    elt.value = key;
-		}
 	    }
+	    if(oldval.length < elt.value.length &&
+	       elt.value.substr(0, oldval.length) === oldval &&
+	       elt.value.length < key.length) {
+		var start = elt.value.length;
+		oldval = elt.value
+		elt.value = key;
+		elt.selectionStart = start;
+	    }
+	    else {
+		oldval = elt.value;
+	    }
+	    elt.setAttribute("oldval", oldval);
 	    return;
 	}
-	if(elt.value.match(/^!?[0-9\.\/]*$/)) {
+	elt.setAttribute("oldval", elt.value);
+	if(elt.value.match(/^!?[0-9\.\/\,]*$/)) {
 	    if(elt.value.indexOf('/') !== -1)
 		content = HELP["net:"];
 	    else if(elt.value.indexOf('.') !== -1)
@@ -2128,6 +2172,7 @@ function set_tooltip_filter(elt) {
 	    return;
 	}
     }
+    elt.setAttribute("oldval", elt.value);
     if(elt.hasAttribute('data-title'))
 	remove_tooltip(elt);
 }

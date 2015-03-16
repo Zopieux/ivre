@@ -18,14 +18,14 @@
 
 from ivre import utils, db, graphroute, config
 
-import sys
-import os
 try:
     from collections import OrderedDict
     USING_ORDEREDDICT = True
 except ImportError:
     USING_ORDEREDDICT = False
-from datetime import datetime
+import sys
+import os
+from six.moves import input
 
 
 def displayhost(dic, showscripts=True, showtraceroute=True, showos=True,
@@ -59,7 +59,7 @@ def displayhost(dic, showscripts=True, showtraceroute=True, showos=True,
                                          infos.get('as_name', '?')))
     if 'starttime' in dic and 'endtime' in dic:
         out.write("\tscan %s - %s\n" %
-                 (dic['starttime'], dic['endtime']))
+                  (dic['starttime'], dic['endtime']))
     if 'extraports' in dic:
         d = dic['extraports']
         for k in d:
@@ -379,10 +379,12 @@ def display_xml_host(h, out=sys.stdout, archive=False):
         out.write('</port>\n')
     out.write('</ports>\n')
 
+
 def displayhost_csv(fields, separator, nastr, dic, out=sys.stdout):
     out.write('\n'.join(separator.join(elt for elt in line)
                         for line in utils.doc2csv(dic, fields, nastr=nastr)))
     out.write('\n')
+
 
 def main():
     try:
@@ -409,6 +411,9 @@ def main():
                         help='Output only IP addresses, one per line.')
     parser.add_argument('--json', action='store_true',
                         help='Output results as JSON documents.')
+    parser.add_argument('--no-screenshots', action='store_true',
+                        help='When used with --json, do not output '
+                        'screenshots data.')
     parser.add_argument('--honeyd', action='store_true',
                         help='Output results as a honeyd config file.')
     parser.add_argument('--nmap-xml', action='store_true',
@@ -437,6 +442,10 @@ def main():
     parser.add_argument('--delete', action='store_true',
                         help='DELETE the matched results instead of '
                         'displaying them.')
+    parser.add_argument('--move-to-archives', action='store_true',
+                        help='ARCHIVE the matched results instead of '
+                        'displaying them (i.e., move the results to '
+                        'the archive collections).')
     if USING_ORDEREDDICT:
         parser.add_argument('--csv', metavar='TYPE',
                             help='Output result as a CSV file. Supported '
@@ -471,7 +480,7 @@ def main():
         for h in x:
             displayhost(h, out=out)
             if os.isatty(out.fileno()):
-                raw_input()
+                input()
             else:
                 out.write('\n')
 
@@ -482,7 +491,7 @@ def main():
             sys.stdout.write(
                 'This will remove any scan result in your database. '
                 'Process ? [y/N] ')
-            ans = raw_input()
+            ans = input()
             if ans.lower() != 'y':
                 sys.exit(-1)
         db.db.nmap.init()
@@ -492,7 +501,7 @@ def main():
             sys.stdout.write(
                 'This will lock your database. '
                 'Process ? [y/N] ')
-            ans = raw_input()
+            ans = input()
             if ans.lower() != 'y':
                 sys.exit(-1)
         db.db.nmap.ensure_indexes()
@@ -506,6 +515,15 @@ def main():
             else:
                 indent = None
             for h in x:
+                del(h['scanid'])
+                for port in h.get('ports', []):
+                    if args.no_screenshots:
+                        for fname in ['screenshot', 'screendata']:
+                            if fname in port:
+                                del port[fname]
+                    elif 'screendata' in port:
+                        port['screendata'] = port['screendata'].encode(
+                            'base64')
                 print(json.dumps(h, indent=indent,
                                  default=db.db.nmap.serialize))
     elif args.short:
@@ -566,6 +584,10 @@ def main():
         def displayfunction(x):
             for h in x:
                 db.db.nmap.remove(h, archive=args.archives)
+    elif args.move_to_archives:
+        def displayfunction(x):
+            for h in x:
+                db.db.nmap.archive(h)
     elif USING_ORDEREDDICT and args.csv is not None:
         fields = {
             "ports": OrderedDict([
@@ -576,23 +598,21 @@ def main():
             "hops": OrderedDict([
                 ["addr", utils.int2ip],
                 ["traces", OrderedDict([
-                     ["hops", OrderedDict([
-                         ["ipaddr", utils.int2ip],
-                         ["ttl", str],
-                         ["rtt", lambda x: (args.csv_na_str if x == '--'
-                                            else str(x))],
-                     ])
-                  ]
+                    ["hops", OrderedDict([
+                        ["ipaddr", utils.int2ip],
+                        ["ttl", str],
+                        ["rtt", lambda x: (args.csv_na_str if x == '--'
+                                           else str(x))],
+                    ])]
                 ])]
             ]),
             "rtt": OrderedDict([
                 ["addr", utils.int2ip],
                 ["traces", OrderedDict([
-                     ["hops", OrderedDict([
-                         ["rtt", lambda x: (args.csv_na_str if x == '--'
-                                            else str(x))],
-                     ])
-                  ]
+                    ["hops", OrderedDict([
+                        ["rtt", lambda x: (args.csv_na_str if x == '--'
+                                           else str(x))],
+                    ])]
                 ])]
             ]),
         }.get(args.csv)
